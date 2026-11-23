@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -607,7 +607,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 for name in draft_layers:
                     kv_cache_spec[name] = replace(
-                        kv_cache_spec[name], is_dspark_window=True
+                        cast(SlidingWindowSpec, kv_cache_spec[name]),
+                        is_dspark_window=True,
                     )
                 target = {
                     name: spec
