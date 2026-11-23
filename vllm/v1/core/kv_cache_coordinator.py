@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     eagle_proof_margin,
+    has_dspark_resume_boundary,
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -75,8 +76,8 @@ def replay_boundaries(
     at ``num_tokens - 1`` (its last token is recomputed for logits), a
     longer sibling matches the final aligned block. They differ only on a
     block-aligned prompt, where retaining just the higher one collapses the
-    resend's hit to 0. The alignment is the scheduler block size, not the
-    finer hash granularity, which would over-estimate the reach.
+    resend's hit to 0. Use the scheduler block size unless all groups can
+    resume on a finer boundary that has an actual Mamba checkpoint.
     """
     if not use_eagle:
         return (num_prompt_tokens - 1,)
@@ -114,6 +115,7 @@ class KVCacheCoordinator(ABC):
             for g in kv_cache_config.kv_cache_groups
         )
         self.scheduler_block_size = scheduler_block_size
+        self.replay_boundary_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
         self.block_pool = BlockPool(
@@ -131,6 +133,18 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+
+        self.verified_draft_groups = frozenset(
+            self.eagle_group_ids
+            if enable_caching
+            and use_eagle
+            and any(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.dspark_verified_prompt
+                for group in kv_cache_config.kv_cache_groups
+            )
+            else ()
+        )
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state
@@ -171,7 +185,7 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
         # Match Mamba checkpoints to Eagle's attention replay boundary.
-        if use_eagle:
+        if use_eagle and not self.verified_draft_groups:
             for manager in self.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.drop_eagle_checkpoint_block = True
@@ -363,17 +377,28 @@ class KVCacheCoordinator(ABC):
         """
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
-            self.scheduler_block_size,
-            use_eagle=bool(self.eagle_group_ids),
+            self.replay_boundary_block_size,
+            use_eagle=bool(self.eagle_group_ids - self.verified_draft_groups),
         )
         for group_id, manager in enumerate(self.single_type_managers):
-            if not manager.enable_caching:
+            if not manager.enable_caching or group_id in self.verified_draft_groups:
                 continue
             manager.cache_blocks(
                 request,
                 self.get_num_cacheable_tokens(num_computed_tokens, group_id),
                 retention_interval=self.retention_interval,
                 replay_boundaries=boundaries,
+            )
+
+    def cache_verified_draft_prompt(self, request: Request, frontier: int) -> None:
+        """Publish whole context-KV blocks only after their target step completes."""
+        for group_id in self.verified_draft_groups:
+            manager = self.single_type_managers[group_id]
+            manager.cache_blocks(
+                request,
+                min(frontier, request.num_prompt_tokens),
+                retention_interval=self.retention_interval,
+                replay_boundaries=(request.num_prompt_tokens - 1,),
             )
 
     def emit_cached_block_events(
@@ -678,9 +703,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     f"{type(spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
-        # managers in every group. TP needs hashing finer than the Mamba block;
-        # DCP accepts equality because it scales the effective full-attention
-        # block instead.
+        # managers in every group. An aligned Mamba state also suffices when
+        # just the target's physical page is wider than the hash unit.
         self.enable_partial_hash_hits = (
             allow_partial_hash_hits
             and partial_hash_hits_enabled(
@@ -691,6 +715,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
         )
         cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
+        if self.enable_partial_hash_hits and has_dspark_resume_boundary(
+            kv_cache_config.kv_cache_groups, hash_block_size
+        ):
+            self.replay_boundary_block_size = cache_hit_alignment_tokens
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
@@ -720,7 +748,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
-            use_eagle = i in self.eagle_group_ids
+            use_eagle = (
+                i in self.eagle_group_ids and i not in self.verified_draft_groups
+            )
 
             # Try to find an existing group with the same spec
             for idx, group in enumerate(self.attention_groups):

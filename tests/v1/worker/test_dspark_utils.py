@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from vllm.config import ParallelConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu import model_runner
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import _get_dspark_parallel_config
@@ -161,6 +161,7 @@ def test_runner_marks_only_replicated_draft_caches(monkeypatch, draft_dcp_size):
     )
     runner = object.__new__(model_runner.GPUModelRunner)
     runner.vllm_config = None
+    runner.speculative_config = None
     runner.dcp_size = 4
     runner.speculator = object.__new__(DFlashSpeculator)
     runner.speculator.dcp_size = draft_dcp_size
@@ -170,3 +171,76 @@ def test_runner_marks_only_replicated_draft_caches(monkeypatch, draft_dcp_size):
 
     assert specs["target"].dcp_sharded
     assert specs["draft"].dcp_sharded == (draft_dcp_size == 4)
+
+
+@pytest.mark.parametrize(
+    "model_type,mixed,expected",
+    [("qwen3_5_moe", False, True), ("qwen3_5", True, False), ("other", False, False)],
+)
+def test_qwen_dspark_tags_only_complete_draft_windows(
+    monkeypatch, model_type, mixed, expected
+):
+    shape = dict(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
+    window = SlidingWindowSpec(sliding_window=4096, **shape)
+    other = FullAttentionSpec(**shape) if mixed else window
+    monkeypatch.setattr(
+        model_runner,
+        "get_kv_cache_spec",
+        lambda _: {"window": window, "draft.0": window, "draft.1": other},
+    )
+    runner = object.__new__(model_runner.GPUModelRunner)
+    runner.vllm_config = None
+    runner.model_config = _FakeModelConfig(_FakeHFConfig(model_type))
+    runner.speculative_config = SimpleNamespace(use_dspark=lambda: True)
+    runner.speculator = object.__new__(DFlashSpeculator)
+    runner.speculator.draft_attn_layer_names = {"draft.0", "draft.1"}
+    runner.speculator.dcp_size = runner.dcp_size = 1
+
+    specs = runner.get_kv_cache_spec()
+    assert not specs["window"].is_dspark_window
+    assert specs["draft.0"].is_dspark_window == expected
+    assert getattr(specs["draft.1"], "is_dspark_window", False) == expected
+
+
+@pytest.mark.parametrize(
+    "excluded", [None, "connector", "target_window", "other_draft"]
+)
+def test_verified_prompt_requires_local_context_only_draft(monkeypatch, excluded):
+    shape = dict(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
+    window = SlidingWindowSpec(sliding_window=4096, **shape)
+    layers = {
+        "target": window if excluded == "target_window" else FullAttentionSpec(**shape),
+        "state": MambaSpec(
+            block_size=16,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        "draft": window,
+    }
+    monkeypatch.setattr(model_runner, "get_kv_cache_spec", lambda _: dict(layers))
+    runner = object.__new__(model_runner.GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=object() if excluded == "connector" else None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, kv_offloading_size=None
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+    )
+    runner.model_config = _FakeModelConfig(_FakeHFConfig("qwen3_5_moe"))
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1, prefill_context_parallel_size=1
+    )
+    arch = "OtherDSpark" if excluded == "other_draft" else "Qwen3DSparkModel"
+    runner.speculative_config = SimpleNamespace(
+        use_dspark=lambda: True,
+        use_eagle_block_drop=lambda: True,
+        draft_model_config=SimpleNamespace(architectures=[arch]),
+    )
+    runner.speculator = object.__new__(DFlashSpeculator)
+    runner.speculator.draft_attn_layer_names = {"draft"}
+    runner.speculator.dcp_size = runner.dcp_size = 1
+
+    assert runner.get_kv_cache_spec()["state"].dspark_verified_prompt == (
+        excluded is None
+    )

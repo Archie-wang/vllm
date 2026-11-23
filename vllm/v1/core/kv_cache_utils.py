@@ -747,6 +747,24 @@ def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCache
     return replace(spec, block_size=block_size)
 
 
+def has_dspark_resume_boundary(
+    groups: Sequence[KVCacheGroupSpec], hash_block_size: int
+) -> bool:
+    """Whether a draft window can resume inside a wider target page."""
+    return any(
+        group.is_eagle_group
+        and isinstance(spec, SlidingWindowSpec)
+        and spec.is_dspark_window
+        and spec.block_size == hash_block_size
+        for group in groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    ) and any(
+        type(spec) is FullAttentionSpec and spec.block_size > hash_block_size
+        for group in groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    )
+
+
 def partial_hash_hits_enabled(
     kv_cache_groups: Sequence[KVCacheGroupSpec],
     hash_block_size: int,
@@ -764,6 +782,10 @@ def partial_hash_hits_enabled(
         and (
             (dcp_world_size == 1 and spec.block_size > hash_block_size)
             or (dcp_world_size > 1 and spec.block_size >= hash_block_size)
+            or (
+                spec.block_size == hash_block_size
+                and has_dspark_resume_boundary(kv_cache_groups, hash_block_size)
+            )
         )
         for group in kv_cache_groups
         for spec in iter_layer_specs(group.kv_cache_spec)
@@ -1748,7 +1770,7 @@ def _promote_local_kv_cache_specs(
                 target_cls,
                 # Promoted specs allocate blocks for all tokens and never free
                 # below the window, so the trailing-edge extension is moot.
-                drop=("extra_retained_tokens",),
+                drop=("extra_retained_tokens", "is_dspark_window"),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )
@@ -2040,9 +2062,9 @@ def _annotate_eagle_groups(
        MLAAttentionSpec and set by drafter attention layers that run a
        non-causal multi-token decode (today only Kimi-K3 DSpark). It survives
        MLAAttentionSpec.merge, so it still identifies a group after per-group
-       spec merging, wherever grouping happens to land. It is sufficient but
-       not necessary: a drafter whose spec is indistinguishable from the
-       target's cannot be found this way.
+       spec merging. For Qwen3.5 DSpark, the runner marks individual sliding
+       window layers; use the original specs so merging otherwise identical
+       target and draft windows cannot discard the marker.
     2. Positional fallback for MTP drafters (including DeepseekV4/V4.1 DSpark), whose
        MTP block reuses the target's own decoder layer and so carries no spec
        marker. Their draft attention layers always register after every
@@ -2056,7 +2078,7 @@ def _annotate_eagle_groups(
     Args:
         vllm_config: Config supplying the speculative method, if any.
         kv_cache_spec: The kv cache spec of each attention layer, in layer
-            registration order. Only read by rule 2.
+            registration order.
         kv_cache_groups: Groups to annotate in place.
         use_trailing_layer_fallback: Enable rule 2. Callers gate this on
             ``_uses_trailing_mtp_layers``.
@@ -2070,6 +2092,10 @@ def _annotate_eagle_groups(
         if any(
             getattr(spec, "non_causal_multi_token_decode", False)
             for spec in iter_layer_specs(group.kv_cache_spec)
+        ) or any(
+            isinstance(layer_spec := kv_cache_spec.get(name), SlidingWindowSpec)
+            and layer_spec.is_dspark_window
+            for name in group.layer_names
         ):
             group.is_eagle_group = True
 

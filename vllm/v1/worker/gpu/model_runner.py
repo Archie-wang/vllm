@@ -67,8 +67,10 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -592,6 +594,52 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def get_kv_cache_spec(self):
         kv_cache_spec = get_kv_cache_spec(self.vllm_config)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and self.model_config.hf_config.model_type in ("qwen3_5", "qwen3_5_moe")
+            and isinstance(self.speculator, DraftModelSpeculator)
+        ):
+            draft_layers = self.speculator.draft_attn_layer_names
+            if draft_layers and all(
+                type(kv_cache_spec.get(name)) is SlidingWindowSpec
+                for name in draft_layers
+            ):
+                for name in draft_layers:
+                    kv_cache_spec[name] = replace(
+                        kv_cache_spec[name], is_dspark_window=True
+                    )
+                target = {
+                    name: spec
+                    for name, spec in kv_cache_spec.items()
+                    if name not in draft_layers
+                }
+                config = self.vllm_config
+                if (
+                    any(isinstance(spec, MambaSpec) for spec in target.values())
+                    and all(
+                        type(spec) is FullAttentionSpec
+                        or (
+                            type(spec) is MambaSpec and spec.mamba_cache_mode == "align"
+                        )
+                        for spec in target.values()
+                    )
+                    and "Qwen3DSparkModel"
+                    in self.speculative_config.draft_model_config.architectures
+                    and self.speculative_config.use_eagle_block_drop()
+                    and config.cache_config.enable_prefix_caching
+                    and config.cache_config.kv_offloading_size is None
+                    and config.kv_transfer_config is None
+                    and not config.scheduler_config.disable_hybrid_kv_cache_manager
+                    and self.parallel_config.pipeline_parallel_size == 1
+                    and self.parallel_config.prefill_context_parallel_size == 1
+                    and self.dcp_size == 1
+                ):
+                    for name, spec in target.items():
+                        if isinstance(spec, MambaSpec):
+                            kv_cache_spec[name] = replace(
+                                spec, dspark_verified_prompt=True
+                            )
         # A draft running at DCP=1 under a DCP target keeps a replicated cache.
         if (
             isinstance(self.speculator, DraftModelSpeculator)

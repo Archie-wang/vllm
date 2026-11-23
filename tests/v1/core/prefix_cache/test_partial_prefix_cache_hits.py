@@ -2144,6 +2144,61 @@ def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary():
     assert num_computed == 4
 
 
+@pytest.mark.parametrize("verified,frontier", [(False, 12), (True, 20)])
+def test_dspark_branch_resumes_inside_target_page_with_private_tail(verified, frontier):
+    shape = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
+    config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], FullAttentionSpec(block_size=8, **shape)),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=4,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    dspark_verified_prompt=verified,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=4, sliding_window=5, is_dspark_window=True, **shape
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    manager = make_kv_cache_manager(
+        config, max_model_len=64, enable_caching=True, hash_block_size=4, use_eagle=True
+    )
+    length = 21 if verified else 17
+    producer = make_request("producer", [7] * length, 4, sha256)
+    branch = make_request("branch", [7] * (length - 1) + [9], 4, sha256)
+    for chunk in (frontier, length - frontier):
+        assert manager.allocate_slots(producer, chunk) is not None
+        producer.num_computed_tokens += chunk
+        manager.new_step_starts()
+        if verified:
+            if chunk == frontier:
+                assert manager.get_computed_blocks(branch)[1] == 0
+                manager.coordinator.cache_verified_draft_prompt(producer, frontier - 1)
+                assert manager.get_computed_blocks(branch)[1] < frontier
+            manager.coordinator.cache_verified_draft_prompt(
+                producer, producer.num_computed_tokens
+            )
+    manager.free(producer)
+    blocks, hit, _ = manager.get_computed_blocks(branch)
+    assert hit == frontier
+    assert manager.allocate_slots(branch, length - hit, hit, blocks) is not None
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert any(copy.src_block_id == blocks.blocks[0][-1].block_id for copy in copies)
+    manager.block_pool.free_blocks(retained)
+
+
 def test_hybrid_sliding_window_group_disables_partial_hash_hits():
     hash_block_size = 2
     sliding_window_block_size = 2 * hash_block_size

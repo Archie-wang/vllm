@@ -849,6 +849,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
+    is_dspark_window: bool = field(default=False, compare=False)
     # The trailing edge of the window is extended by ``extra_retained_tokens``
     # so that those extra trailing tokens' blocks are retained (but not
     # attended). This is needed for multi-module spec decoding which can
@@ -1046,6 +1047,7 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    dspark_verified_prompt: bool = False
 
     @property
     def state_content_size_bytes(self) -> int:

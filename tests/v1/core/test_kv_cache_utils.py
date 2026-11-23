@@ -4313,6 +4313,31 @@ def test_qwen3_5_mtp_draft_group_annotated_on_hybrid_path(caplog_vllm):
     assert "could be identified as the draft model's" not in caplog_vllm.text
 
 
+def test_dspark_window_groups_keep_draft_protection_off_target_only_groups():
+    specs = _qwen3_5_hybrid_specs(with_mtp_layer=False)
+    window = new_sliding_window_spec(sliding_window=4096)
+    specs["target.window"] = window
+    draft_names = {f"draft.{index}" for index in range(6)}
+    for name in sorted(draft_names):
+        specs[name] = replace(window, is_dspark_window=True)
+    groups = get_kv_cache_groups(_spec_decode_grouping_config(), specs)
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    for group in groups:
+        assert group.is_eagle_group == bool(draft_names.intersection(group.layer_names))
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_dspark_window_resumes_on_mamba_granularity_inside_wider_target_page(draft):
+    target = new_kv_cache_spec(block_size=32)
+    window = replace(new_sliding_window_spec(block_size=16), is_dspark_window=draft)
+    groups = [
+        KVCacheGroupSpec(["target"], target),
+        KVCacheGroupSpec(["draft"], window, is_eagle_group=draft),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(mamba_cache_mode="align")),
+    ]
+    assert kv_cache_utils.partial_hash_hits_enabled(groups, 16) == draft
+
+
 @pytest.mark.parametrize("method", ["eagle", "eagle3", "dspark"])
 def test_non_mtp_eagle_hybrid_still_warns(caplog_vllm, method):
     # Other drafters are not covered by the trailing-layer rule, so an

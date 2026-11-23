@@ -344,6 +344,12 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
+        self.has_verified_draft_prompt = bool(
+            self.kv_cache_manager.coordinator.verified_draft_groups
+        )
+        if self.has_verified_draft_prompt:
+            self.use_eagle_block_drop = False
+            logger.info("Using verified DSpark prompt windows for local prefix caching")
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
@@ -2146,6 +2152,17 @@ class Scheduler(SchedulerInterface):
                         num_draft_tokens=adj_draft_tokens,
                         num_accepted=num_accepted,
                         detailed=self.spec_decode_metrics_level == "detailed",
+                    )
+
+            if (
+                self.has_verified_draft_prompt
+                and not output_is_stale
+                and request.status == RequestStatus.RUNNING
+            ):
+                frontier = request.num_computed_tokens - request.num_in_flight_tokens
+                if frontier - num_tokens_scheduled < request.num_prompt_tokens:
+                    self.kv_cache_manager.coordinator.cache_verified_draft_prompt(
+                        request, frontier
                     )
 
             # Free encoder inputs only after the step has actually executed.
